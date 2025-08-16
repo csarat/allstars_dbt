@@ -5,7 +5,7 @@
 
 
 select id
-from "appdb"."reporting"."my_first_dbt_model"
+from "analytics_dev"."csarat"."analytics_prd__sch_rpt__first_model"
 where id is null
 
 

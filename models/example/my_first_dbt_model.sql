@@ -7,7 +7,7 @@
     Try changing "table" to "view" below
 */
 
-{{ config(materialized='table') }}
+{{ config(materialized='table',alias='first_model',database='analytics_prd',schema='sch_rpt') }}
 
 with source_data as (
 
