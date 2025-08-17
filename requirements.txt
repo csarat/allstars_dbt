@@ -2,6 +2,7 @@
 requests
 pip-system-certs
 boto3
+click
 black
 pyyaml
 python-dotenv

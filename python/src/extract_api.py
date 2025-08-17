@@ -8,6 +8,7 @@ from pathlib import Path
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import requests
+import click
 
 import boto3
 from botocore.exceptions import ClientError
@@ -16,10 +17,10 @@ import polars as pl
 from polars.exceptions import ComputeError
 
 try:
-    BASE_DIR = Path(__file__).parent.resolve()
+    BASE_DIR = Path(__file__).parent.parent.parent.resolve()
 except NameError:
     # Fallback for interactive sessions (no __file__)
-    BASE_DIR = Path(os.getcwd()).resolve()
+    BASE_DIR = Path(os.getcwd()).parent.parent.parent.resolve()
 LOG_DIR = BASE_DIR / "logs"
 
 
@@ -72,7 +73,7 @@ def setup_logging(
 
 
 def get_credentials():
-    with open("../env.json", "r") as file:
+    with open(BASE_DIR / "env.json", "r") as file:
         creds = json.load(file)
     return creds
 
@@ -85,6 +86,7 @@ DAYSMART_API_GRANT_TYPE = "client_credentials"
 POSTGRES_DB = credentials["POSTGRES_DB"]
 POSTGRES_USER = credentials["POSTGRES_USER"]
 POSTGRES_PASSWORD = credentials["POSTGRES_PASSWORD"]
+S3_BUCKET = credentials["S3_BUCKET"]
 BASE_URL = "https://api.dashplatform.com"
 LOG = setup_logging()
 
@@ -105,21 +107,10 @@ def get_bearer_token():
         raise Exception(response.json())
 
 
-bearer_token = get_bearer_token()
-ENV = "dev"
-S3_BUCKET = os.getenv("S3_BUCKET", f"allstars-dl-us-west-2-{ENV}")
-PG_CONN = os.getenv(
-    "PG_CONN",
-    f"dbname={POSTGRES_DB} user={POSTGRES_USER} password={POSTGRES_PASSWORD} host=localhost port=5432",
-)
-KEEP_RAW_JSONL = os.getenv("KEEP_RAW_JSONL", "true").lower() == "false"
-CSV_COMPRESS = os.getenv("CSV_COMPRESS", "false").lower() == "true"
-
-
 # -------------------------
 # Fetcher
 # -------------------------
-def get_index_data(end_point):
+def get_index_data(end_point, bearer_token):
     url = BASE_URL + "/v1/" + end_point
     headers = {
         "Content-Type": "application/vnd.api+json",
@@ -218,7 +209,7 @@ def write_jsonl_to_s3(records: list[dict], bucket: str, key: str, s3_client=None
     if not records:
         return
     if s3_client is None:
-        s3_client = boto3.client("s3")
+        s3_client = boto3.Session(profile_name="etl_user").client("s3")
 
     buf = io.BytesIO()
     with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
@@ -345,10 +336,26 @@ def load_polars_df_to_postgres(
 
 
 # -------------------------
-# Main
+# Process data
 # -------------------------
-def main():
-    # ) Fetch data from API
+def process(env):
+    """Extract data from Dash API and load to S3 and Postgres."""
+    # Setup logging
+    log = setup_logging()
+
+    # Get bearer token
+    bearer_token = get_bearer_token()
+
+    # Configure environment-specific settings
+    s3_bucket = f"{S3_BUCKET}{env}"
+    pg_conn = f"dbname={POSTGRES_DB} user={POSTGRES_USER} password={POSTGRES_PASSWORD} host=localhost port=5432"
+    keep_raw_jsonl = False
+    csv_compress = True
+
+    log.info(f"Starting extraction for environment: {env}")
+    log.info(f"Using S3 bucket: {s3_bucket}")
+
+    # Fetch data from API
     DASH_ENTITIES = [
         "event-types",
         "events",
@@ -365,38 +372,58 @@ def main():
     ]
 
     for entity in DASH_ENTITIES:
-        s3_target = f"""all_{entity.replace("-","_")}"""
-        print(s3_target)
-        db_schema = "sch_raw"
-        db_target = s3_target
-        records = get_index_data(entity)
-        LOG.info(f"Fetched {len(records)} records from /v1/{entity}")
+        try:
+            log.info(f"Processing entity: {entity}")
+            s3_target = f"""all_{entity.replace("-","_")}"""
+            print(s3_target)
+            db_schema = "sch_raw"
+            db_target = s3_target
+            records = get_index_data(entity, bearer_token)
+            log.info(f"Fetched {len(records)} records from /v1/{entity}")
 
-        # 2) Optional: write raw JSONL.gz to S3
-        run_date = datetime.now().strftime("%Y-%m-%d")
-        s3_client = boto3.client("s3")
+            # 2) Optional: write raw JSONL.gz to S3
+            run_date = datetime.now().strftime("%Y-%m-%d")
+            s3_client = boto3.Session(profile_name="etl_user").client("s3")
 
-        if KEEP_RAW_JSONL and records:
-            raw_key = f"raw/{s3_target}/ingest_date={run_date}/{s3_target}.jsonl.gz"
-            write_jsonl_to_s3(records, S3_BUCKET, raw_key, s3_client)
-            LOG.info(f"Wrote raw JSONL to s3://{S3_BUCKET}/{raw_key}")
+            if keep_raw_jsonl and records:
+                raw_key = f"raw/{s3_target}/ingest_date={run_date}/{s3_target}.jsonl.gz"
+                log.info(f"Writing raw JSONL to s3://{s3_bucket}/{raw_key}")
+                write_jsonl_to_s3(records, s3_bucket, raw_key, s3_client)
 
-        # 3) Normalize to Polars
-        df = records_to_polars(records)
-        LOG.info(f"Normalized to Polars: {df.height} rows, {len(df.columns)} columns")
+            # 3) Normalize to Polars
+            df = records_to_polars(records)
+            log.info(f"Normalized to Polars: {df.height} rows, {len(df.columns)} columns")
 
-        # 4) Write CSV to S3
-        csv_key = f"catalog/{s3_target}/ingest_date={run_date}/{s3_target}.csv"
-        if CSV_COMPRESS:
-            csv_key += ".gz"
+            # 4) Write CSV to S3
+            csv_key = f"catalog/{s3_target}/ingest_date={run_date}/{s3_target}.csv"
+            if csv_compress:
+                csv_key += ".gz"
 
-        # 5) Replace table in Postgres
-        load_polars_df_to_postgres(
-            df, schema=db_schema, table=db_target, conn_str=PG_CONN
-        )
-        LOG.info(f"Replaced Postgres table {db_target}")
+            log.info(f"Writing CSV to s3://{s3_bucket}/{csv_key}")
+            write_csv_to_s3_polars(
+                df, s3_bucket, csv_key, compress=csv_compress, s3_client=s3_client
+            )
 
-        break
+            # 5) Replace table in Postgres
+            load_polars_df_to_postgres(
+                df, schema=db_schema, table=db_target, conn_str=pg_conn
+            )
+            log.info(f"Replaced Postgres table {db_target}")
+
+            #break
+        except Exception as e:
+            log.error(f"Error processing entity: {entity}")
+            raise e
+
+@click.command()
+@click.option(
+    "--env",
+    default="dev",
+    help="Environment (dev, staging, prod)",
+    type=click.Choice(["dev", "staging", "prod"]),
+)
+def main(env):
+    process(env)
 
 
 if __name__ == "__main__":
