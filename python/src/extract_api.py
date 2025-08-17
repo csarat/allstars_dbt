@@ -154,7 +154,7 @@ def records_to_polars(records: list[dict]) -> pl.DataFrame:
             base = {
                 k: v for k, v in r.items() if k not in ("attributes", "relationships")
             }
-            base.update(r.get("attributes", {}))
+            # base.update(r.get("attributes", {}))
             return base
         return r
 
@@ -348,7 +348,8 @@ def process(env):
 
     # Configure environment-specific settings
     s3_bucket = f"{S3_BUCKET}{env}"
-    pg_conn = f"dbname={POSTGRES_DB} user={POSTGRES_USER} password={POSTGRES_PASSWORD} host=localhost port=5432"
+    database_name = f"{POSTGRES_DB}{env}"
+    pg_conn = f"dbname={database_name} user={POSTGRES_USER} password={POSTGRES_PASSWORD} host=localhost port=5432"
     keep_raw_jsonl = False
     csv_compress = True
 
@@ -375,9 +376,8 @@ def process(env):
         try:
             log.info(f"Processing entity: {entity}")
             s3_target = f"""all_{entity.replace("-","_")}"""
-            print(s3_target)
             db_schema = "sch_raw"
-            db_target = s3_target
+            db_target = entity.replace("-","_")
             records = get_index_data(entity, bearer_token)
             log.info(f"Fetched {len(records)} records from /v1/{entity}")
 
@@ -410,7 +410,7 @@ def process(env):
             )
             log.info(f"Replaced Postgres table {db_target}")
 
-            #break
+            # break
         except Exception as e:
             log.error(f"Error processing entity: {entity}")
             raise e
@@ -419,8 +419,8 @@ def process(env):
 @click.option(
     "--env",
     default="dev",
-    help="Environment (dev, staging, prod)",
-    type=click.Choice(["dev", "staging", "prod"]),
+    help="Environment (dev, prd)",
+    type=click.Choice(["dev", "prd"]),
 )
 def main(env):
     process(env)
