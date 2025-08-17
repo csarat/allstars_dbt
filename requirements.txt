@@ -6,7 +6,7 @@ click
 black
 pyyaml
 python-dotenv
-polars
+polars[postgres]
 psycopg2-binary
 ipykernel
 ipython

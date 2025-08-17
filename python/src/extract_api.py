@@ -283,48 +283,28 @@ def load_polars_df_to_postgres(
     schema: str = "public",
 ):
     """
-    Replaces target table: TRUNCATE then bulk INSERT via COPY.
+    Replaces target table: TRUNCATE then bulk INSERT via Polars write_to_database.
     Creates table if absent (all columns TEXT for simplicity).
     """
     if df.height == 0:
         LOG.info("No rows; skipping Postgres replace.")
         return
 
-    cols = df.columns
-    collist_sql = ", ".join([f'"{c}"' for c in cols])
-
     conn = psycopg2.connect(conn_str)
     conn.autocommit = False
     try:
         with conn.cursor() as cur:
-            # Create table if missing (all TEXT columns)
-            create_cols_sql = ", ".join([f'"{c}" text' for c in cols])
-
             # Create schema
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
             # DROP target
             cur.execute(f'DROP TABLE IF EXISTS "{schema}"."{table}";')
-            cur.execute(
-                f"""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_schema='{schema}' AND table_name='{table}'
-                    ) THEN
-                        EXECUTE 'CREATE TABLE "{schema}"."{table}" ({create_cols_sql})';
-                    END IF;
-                END $$;
-            """
-            )
-
-            # COPY from Polars CSV into target
-            csv_buf = io.StringIO()
-            df.write_csv(csv_buf, include_header=False)
-            csv_buf.seek(0)
-            cur.copy_expert(
-                f'COPY "{schema}"."{table}" ({collist_sql}) FROM STDIN WITH (FORMAT CSV)',
-                csv_buf,
+            
+            # Create table with proper schema inference
+            # Let Polars handle the table creation with proper data types
+            df.write_database(
+                table_name=f"{schema}.{table}",
+                connection=conn,
+                if_table_exists="replace"
             )
 
         conn.commit()
@@ -358,18 +338,18 @@ def process(env):
 
     # Fetch data from API
     DASH_ENTITIES = [
-        "event-types",
+        # "event-types",
         "events",
-        "customers",
-        "bookings",
-        "resources",
-        "stat-events",
-        "customer-events",
-        "addresses",
-        "invoices",
-        "event-comments",
-        "event-employees",
-        "customer-relationships",
+        # "customers",
+        # "bookings",
+        # "resources",
+        # "stat-events",
+        # "customer-events",
+        # "addresses",
+        # "invoices",
+        # "event-comments",
+        # "event-employees",
+        # "customer-relationships",
     ]
 
     for entity in DASH_ENTITIES:
@@ -410,7 +390,7 @@ def process(env):
             )
             log.info(f"Replaced Postgres table {db_target}")
 
-            # break
+            break
         except Exception as e:
             log.error(f"Error processing entity: {entity}")
             raise e
