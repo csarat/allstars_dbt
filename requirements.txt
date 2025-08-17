@@ -1,2 +1,14 @@
+
+requests
+pip-system-certs
+boto3
+black
+pyyaml
+python-dotenv
+polars
+psycopg2-binary
+ipykernel
+ipython
+jupyterlab
 dbt-core
 dbt-postgres
