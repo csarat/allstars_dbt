@@ -6,10 +6,14 @@ click
 black
 pyyaml
 python-dotenv
-polars[postgres]
+polars[postgres,s3]
+s3fs
 psycopg2-binary
 ipykernel
 ipython
 jupyterlab
 dbt-core
 dbt-postgres
+pandas
+sqlalchemy
+pyarrow

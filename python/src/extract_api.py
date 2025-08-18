@@ -20,7 +20,7 @@ try:
     BASE_DIR = Path(__file__).parent.parent.parent.resolve()
 except NameError:
     # Fallback for interactive sessions (no __file__)
-    BASE_DIR = Path(os.getcwd()).parent.parent.parent.resolve()
+    BASE_DIR = Path(os.getcwd()).parent.parent.resolve()
 LOG_DIR = BASE_DIR / "logs"
 
 
@@ -144,7 +144,6 @@ def records_to_polars(records: list[dict]) -> pl.DataFrame:
     """
     Lifts JSON:API objects (id/type + attributes.*).
     Builds a Polars DF with full-length schema inference.
-    If mixed types are detected across rows, falls back to string-cast.
     """
     if not records:
         return pl.DataFrame([])
@@ -154,34 +153,30 @@ def records_to_polars(records: list[dict]) -> pl.DataFrame:
             base = {
                 k: v for k, v in r.items() if k not in ("attributes", "relationships")
             }
-            # base.update(r.get("attributes", {}))
+            base.update(r.get("attributes", {}))
             return base
         return r
 
     lifted = [lift_one(r) for r in records]
 
-    # First attempt: infer using full data scan
-    try:
-        df = pl.from_dicts(lifted, infer_schema_length=None)  # scan all rows
-    except ComputeError:
-        # Fallback: cast every value to string (JSON for nested), preserving None
-        def to_str(v):
+    # ALWAYS convert nested structures to JSON strings to preserve key-value pairs
+    def process_nested_values(row):
+        processed_row = {}
+        for k, v in row.items():
             if v is None:
-                return None
-            # stringify nested structures to preserve info for CSV/SQL
-            if isinstance(v, (dict, list)):
-                return json.dumps(v, separators=(",", ":"), default=str)
-            return str(v)
+                processed_row[k] = None
+            elif isinstance(v, (dict, list)):
+                # Convert nested structures to JSON strings to preserve structure
+                processed_row[k] = json.dumps(v, separators=(",", ":"), default=str)
+            else:
+                processed_row[k] = v
+        return processed_row
 
-        lifted_str = [{k: to_str(v) for k, v in row.items()} for row in lifted]
-        df = pl.from_dicts(lifted_str, infer_schema_length=None)
+    # Process all rows to convert nested structures to JSON strings
+    processed_lifted = [process_nested_values(row) for row in lifted]
 
-    # Unnest any 1-level struct columns if they exist (after first path)
-    struct_cols = [
-        c for c, dt in zip(df.columns, df.dtypes) if isinstance(dt, pl.Struct)
-    ]
-    for c in struct_cols:
-        df = df.unnest(c)
+    # Create DataFrame with processed data
+    df = pl.from_dicts(processed_lifted, infer_schema_length=None)
 
     # Put id first if present
     if "id" in df.columns:
@@ -273,6 +268,63 @@ def write_csv_to_s3_polars(
         raise RuntimeError(f"S3 CSV upload failed: {e}")
 
 
+def write_parquet_to_s3_polars(
+    df: pl.DataFrame,
+    bucket: str,
+    key: str,
+    compression: str = "snappy",
+    s3_client=None,
+    **to_parquet_kwargs,
+):
+    """
+    Write polars DataFrame to s3://bucket/key as Parquet.
+    to_parquet_kwargs → passed to Polars write_parquet (e.g., compression='snappy').
+    """
+    if df.height == 0:
+        return
+    if s3_client is None:
+        s3_client = boto3.Session(profile_name="etl_user").client("s3")
+
+    # Write DataFrame to bytes buffer
+    buf = io.BytesIO()
+    df.write_parquet(buf, compression=compression, **to_parquet_kwargs)
+    body = buf.getvalue()
+
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=body,
+            ContentType="application/octet-stream",
+        )
+    except ClientError as e:
+        raise RuntimeError(f"S3 Parquet upload failed: {e}")
+
+
+def write_parquet_to_s3_polars_native(
+    df: pl.DataFrame,
+    bucket: str,
+    key: str,
+    compression: str = "snappy",
+    **to_parquet_kwargs,
+):
+    """
+    Write polars DataFrame directly to s3://bucket/key as Parquet using native S3 support.
+    This is more memory efficient as it doesn't buffer the entire file in memory.
+    """
+    if df.height == 0:
+        return
+
+    # Construct S3 path
+    s3_path = f"s3://{bucket}/{key}"
+
+    try:
+        # Write directly to S3
+        df.write_parquet(s3_path, compression=compression, **to_parquet_kwargs)
+    except Exception as e:
+        raise RuntimeError(f"S3 Parquet upload failed: {e}")
+
+
 # -------------------------
 # Postgres Loader (TRUNCATE + INSERT)
 # -------------------------
@@ -290,21 +342,33 @@ def load_polars_df_to_postgres(
         LOG.info("No rows; skipping Postgres replace.")
         return
 
+    # Convert psycopg2 connection string to URL format
+    conn_parts = {}
+    for part in conn_str.split():
+        if "=" in part:
+            key, value = part.split("=", 1)
+            conn_parts[key] = value
+
+    # Create PostgreSQL URL
+    pg_url = f"postgresql://{conn_parts['user']}:{conn_parts['password']}@{conn_parts['host']}:{conn_parts['port']}/{conn_parts['dbname']}"
+
+    # log.info(f"pg_url={pg_url}")
+
     conn = psycopg2.connect(conn_str)
-    conn.autocommit = False
+    conn.autocommit = True
     try:
         with conn.cursor() as cur:
             # Create schema
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
             # DROP target
-            cur.execute(f'DROP TABLE IF EXISTS "{schema}"."{table}";')
-            
+            # cur.execute(f'DROP TABLE IF EXISTS "{schema}"."{table}";')
+
             # Create table with proper schema inference
             # Let Polars handle the table creation with proper data types
             df.write_database(
                 table_name=f"{schema}.{table}",
-                connection=conn,
-                if_table_exists="replace"
+                connection=pg_url,
+                if_table_exists="replace",
             )
 
         conn.commit()
@@ -338,18 +402,18 @@ def process(env):
 
     # Fetch data from API
     DASH_ENTITIES = [
-        # "event-types",
+        "event-types",
         "events",
-        # "customers",
-        # "bookings",
-        # "resources",
-        # "stat-events",
-        # "customer-events",
-        # "addresses",
-        # "invoices",
-        # "event-comments",
-        # "event-employees",
-        # "customer-relationships",
+        "customers",
+        "bookings",
+        "resources",
+        "stat-events",
+        "customer-events",
+        "addresses",
+        "invoices",
+        "event-comments",
+        "event-employees",
+        "customer-relationships",
     ]
 
     for entity in DASH_ENTITIES:
@@ -357,7 +421,7 @@ def process(env):
             log.info(f"Processing entity: {entity}")
             s3_target = f"""all_{entity.replace("-","_")}"""
             db_schema = "sch_raw"
-            db_target = entity.replace("-","_")
+            db_target = entity.replace("-", "_")
             records = get_index_data(entity, bearer_token)
             log.info(f"Fetched {len(records)} records from /v1/{entity}")
 
@@ -372,16 +436,18 @@ def process(env):
 
             # 3) Normalize to Polars
             df = records_to_polars(records)
-            log.info(f"Normalized to Polars: {df.height} rows, {len(df.columns)} columns")
+            log.info(
+                f"Normalized to Polars: {df.height} rows, {len(df.columns)} columns"
+            )
 
-            # 4) Write CSV to S3
-            csv_key = f"catalog/{s3_target}/ingest_date={run_date}/{s3_target}.csv"
-            if csv_compress:
-                csv_key += ".gz"
+            # 4) Write Parquet to S3 using Polars
+            parquet_key = (
+                f"catalog/{s3_target}/ingest_date={run_date}/{s3_target}.parquet"
+            )
 
-            log.info(f"Writing CSV to s3://{s3_bucket}/{csv_key}")
-            write_csv_to_s3_polars(
-                df, s3_bucket, csv_key, compress=csv_compress, s3_client=s3_client
+            log.info(f"Writing Parquet to s3://{s3_bucket}/{parquet_key}")
+            write_parquet_to_s3_polars(
+                df, s3_bucket, parquet_key, compression="snappy", s3_client=s3_client
             )
 
             # 5) Replace table in Postgres
@@ -390,10 +456,11 @@ def process(env):
             )
             log.info(f"Replaced Postgres table {db_target}")
 
-            break
+            # break
         except Exception as e:
             log.error(f"Error processing entity: {entity}")
             raise e
+
 
 @click.command()
 @click.option(
